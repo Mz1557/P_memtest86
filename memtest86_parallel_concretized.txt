@@ -1,0 +1,189 @@
+[memtest86 알고리즘 가속/병렬화 구체화 문서]
+
+목표
+- 기존 MemTest86 계열 알고리즘(1~8)을 유지하면서 실행 시간을 줄인다.
+- 오류 검출 민감도를 떨어뜨리지 않고 멀티코어/메모리 토폴로지 기반 병렬화를 적용한다.
+- "16비트씩만 검사" 같은 오해를 피하고, 실제 병목(IMC/채널/뱅크 충돌)을 기준으로 설계한다.
+
+핵심 전제
+1) 병렬화는 가능하지만 무한정 스케일되지 않는다.
+- 이유: DRAM 채널 대역폭, IMC 스케줄러, row-buffer hit/miss 패턴이 병목이 된다.
+
+2) 무작정 코어 수만 늘리면 오히려 성능이 떨어질 수 있다.
+- 같은 bank group에 접근이 집중되면 충돌 때문에 효율이 하락한다.
+
+3) 따라서 "주소 분할"은 단순 연속 범위 분할이 아니라 토폴로지 인식 분할이 좋다.
+- channel/rank/bank_group 정보를 기준으로 작업 큐를 분산한다.
+
+--------------------------------------------------
+1. 실행 파이프라인(권장)
+--------------------------------------------------
+Stage A: 환경/토폴로지 수집
+- SMBIOS/SPD/IMC 레지스터로 DIMM/채널 구조 파악
+- 물리주소 -> (CH,RANK,BG,BANK,ROW,COL) 디코더 준비
+
+Stage B: 작업 분할(Job Sharding)
+- 전체 메모리를 Job 단위(예: 8MiB~64MiB)로 쪼갠다.
+- Job마다 "주요 채널/뱅크그룹" 태그를 붙인다.
+
+Stage C: 스케줄링
+- 코어별 큐를 두고, 같은 시점에 서로 다른 CH/BG로 분산 배치
+- 충돌이 많은 Job은 뒤로 미루고 다른 Job 선행
+
+Stage D: 테스트 실행
+- 알고리즘 1~8을 Job별로 수행
+- 테스트별로 캐시 정책/메모리 접근 stride를 다르게 적용
+
+Stage E: 검증/리포트
+- 실패 주소를 DRAM 토폴로지와 함께 기록
+- DIMM 슬롯 단위로 집계(STDF/CSV/JSON 등)
+
+--------------------------------------------------
+2. 알고리즘별 병렬화 포인트
+--------------------------------------------------
+[1] Moving Inversions
+- 병렬화: 주소 구간 분할 후 독립 실행
+- 주의: 인접 구간 경계에서 순서 의존성 최소화
+
+[2] Modulo-X
+- 병렬화: offset 세트를 코어별 분담
+- 주의: 같은 modulo residue를 동시에 과도하게 때리지 않도록 분산
+
+[3] Address Test (Walking Ones)
+- 병렬화: 주소 비트군을 코어별 분담
+- 주의: 주소선 자체 검증이므로 전역 동기화 지점 필요
+
+[4] Address Test (Own Address)
+- 병렬화: 구간 병렬 가능
+- 주의: 쓰기/읽기 페이즈 분리 시 barrier 필요
+
+[5] Block Move
+- 병렬화: src/dst 쌍을 채널 분산 배치
+- 주의: 같은 메모리 컨트롤러 경로에 몰리면 역효과
+
+[6] Random Sequence
+- 병렬화: 코어별 독립 seed 사용
+- 주의: 재현성 위해 (seed, core_id, pass_id) 로깅 필수
+
+[7] Bit Fade
+- 병렬화: 채움(fill)은 병렬, 대기는 전역, 검증은 병렬
+- 주의: 대기 시간 타이머 기준은 단일 기준시각 사용
+
+[8] Hammer
+- 병렬화: victim row set을 코어별 분리
+- 주의: 동일 bank 동시 hammer 방지(간섭으로 원인 분석 어려움)
+
+--------------------------------------------------
+3. 스케줄러 설계(구체)
+--------------------------------------------------
+자료구조 예시
+
+struct Job {
+    uint64_t start;
+    uint64_t bytes;
+    uint8_t channel;      // 주소 디코더 기반 추정 채널
+    uint8_t bank_group;   // 충돌 회피용 태그
+    uint8_t algo_id;      // 1~8 알고리즘
+};
+
+struct CoreState {
+    uint32_t core_id;
+    uint8_t last_channel;
+    uint8_t last_bank_group;
+    uint64_t bytes_done;
+};
+
+스케줄링 규칙
+- 규칙1: 직전 Job과 channel이 다르면 우선순위 +2
+- 규칙2: 직전 Job과 bank_group이 다르면 우선순위 +1
+- 규칙3: 대기시간 긴 테스트(bit fade)는 별도 페이즈로 묶어 배치
+- 규칙4: hammer는 동시 실행 victim set 겹침 금지
+
+--------------------------------------------------
+4. 주석 포함 의사코드(C++ 스타일)
+--------------------------------------------------
+
+// 병렬 테스트 메인 루프
+void run_parallel_pass(std::vector<Job>& jobs, uint32_t core_count) {
+    // 각 코어 상태 초기화
+    std::vector<CoreState> state(core_count);
+    for (uint32_t i = 0; i < core_count; ++i) {
+        state[i] = CoreState{ i, 0xFF, 0xFF, 0 };
+    }
+
+    // lock-free queue 또는 coarse spinlock queue 사용 가능
+    ConcurrentJobQueue q(jobs);
+
+    parallel_for_each_core(core_count, [&](uint32_t core_id) {
+        while (true) {
+            // 현재 코어의 직전 CH/BG와 덜 충돌하는 Job 선택
+            // 주석: 단순 FIFO보다 이 선택 로직이 체감 성능에 크게 영향
+            auto job = q.pop_best_fit(state[core_id].last_channel,
+                                      state[core_id].last_bank_group);
+            if (!job.has_value()) break;
+
+            // 알고리즘별 테스트 실행
+            switch (job->algo_id) {
+                case 1: test_moving_inversions(*job); break;
+                case 2: test_modulo_x(*job, 20); break;
+                case 3: test_address_walking_ones(*job); break;
+                case 4: test_own_address(*job); break;
+                case 5: test_block_move(*job); break;
+                case 6: test_random_sequence(*job, core_id); break;
+                case 7: test_bit_fade_phase(*job); break;
+                case 8: test_rowhammer(*job); break;
+                default: break;
+            }
+
+            // 코어 상태 업데이트 (다음 job 선택 품질 향상)
+            state[core_id].last_channel = job->channel;
+            state[core_id].last_bank_group = job->bank_group;
+            state[core_id].bytes_done += job->bytes;
+        }
+    });
+}
+
+// RowHammer 예시 (충돌 회피 주석 포함)
+void test_rowhammer(const Job& j) {
+    // 주석: 같은 bank/victim을 다른 코어가 동시에 hammer 하지 않도록
+    // victim reservation bitmap을 먼저 획득해야 분석 가능성이 높다.
+    if (!try_reserve_victim_set(j)) return;
+
+    for (uint32_t r = 0; r < HAMMER_ROUNDS; ++r) {
+        // aggressor A/B 반복 접근
+        hammer_pair_access(j, r);
+    }
+
+    // 주석: hammer 이후 victim 검증은 즉시 수행해야 retention 변수 감소
+    verify_victim_rows(j);
+    release_victim_set(j);
+}
+
+--------------------------------------------------
+5. 성능 측정 지표(필수)
+--------------------------------------------------
+- Throughput: GiB/s (전체/알고리즘별)
+- Error yield: 오류/테라바이트
+- Collision ratio: 같은 CH/BG 연속 배치 비율
+- Row conflict latency: hammer/normal 각각 평균 지연
+- Reproducibility: 동일 seed 재실행 시 동일 오류 재현율
+
+--------------------------------------------------
+6. 실제 적용 체크리스트
+--------------------------------------------------
+1) 먼저 단일코어 기준값 확보(기준 성능/오류율)
+2) 2코어 -> 4코어 -> N코어로 단계적 확장
+3) 코어 증가 대비 GiB/s 증가율이 꺾이는 지점 찾기
+4) 꺾이는 지점에서 스케줄러 규칙(채널 분산) 튜닝
+5) 최종적으로 오류 재현성(동일 주소 재검출) 검증
+
+--------------------------------------------------
+7. 결론
+--------------------------------------------------
+- "멀리 떨어진 두 비트를 동시에 검사"는 개념적으로 가능하지만,
+  실제 성능/검출력은 DRAM 토폴로지 충돌 관리가 좌우한다.
+- 가장 효과적인 방법은:
+  (a) 토폴로지 인식 주소 디코딩
+  (b) 충돌 회피 스케줄러
+  (c) 알고리즘별 병렬 전략 분리
+- 즉, 단순 병렬화보다 "충돌을 줄이는 병렬화"가 핵심이다.

@@ -1,0 +1,323 @@
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace nextgen_memtest {
+
+using Clock = std::chrono::steady_clock;
+
+struct MemoryRange {
+    uint64_t start;
+    uint64_t bytes;
+};
+
+struct DramAddress {
+    uint32_t channel;
+    uint32_t rank;
+    uint32_t bank_group;
+    uint32_t bank;
+    uint32_t row;
+    uint32_t column;
+};
+
+struct FailureRecord {
+    uint64_t physical_addr;
+    uint64_t expected;
+    uint64_t observed;
+    DramAddress dram;
+    std::string dimm_label;
+};
+
+struct DimmInfo {
+    std::string slot;
+    std::string vendor;
+    std::string serial;
+};
+
+struct TestConfig {
+    uint32_t logical_cores = std::max(1u, std::thread::hardware_concurrency());
+    uint64_t total_bytes = 128ull * 1024ull * 1024ull;
+    uint32_t rowhammer_rounds = 25000;
+    std::string stdf_path = "memtest_result.stdf";
+};
+
+class AddressDecoder {
+public:
+    DramAddress decode(uint64_t physical) const {
+        DramAddress d{};
+        d.channel = static_cast<uint32_t>((physical >> 6) & 0x1);
+        d.rank = static_cast<uint32_t>((physical >> 17) & 0x1);
+        d.bank_group = static_cast<uint32_t>(((physical >> 14) ^ (physical >> 18)) & 0x3);
+        d.bank = static_cast<uint32_t>(((physical >> 16) ^ (physical >> 20)) & 0x7);
+        d.row = static_cast<uint32_t>((physical >> 18) & 0x7FFF);
+        d.column = static_cast<uint32_t>((physical >> 3) & 0x3FF);
+        return d;
+    }
+
+    std::string map_to_dimm(const DramAddress& d, const std::vector<DimmInfo>& dimms) const {
+        if (dimms.empty()) {
+            return "UNKNOWN";
+        }
+        const auto idx = static_cast<size_t>(d.channel % dimms.size());
+        std::ostringstream os;
+        os << dimms[idx].slot << "(" << dimms[idx].vendor << ",SN:" << dimms[idx].serial << ")";
+        return os.str();
+    }
+};
+
+class STDFWriter {
+public:
+    explicit STDFWriter(const std::string& path) : out_(path, std::ios::binary) {}
+
+    bool ok() const { return out_.is_open(); }
+
+    void write_mir(const std::string& cpu_name, uint32_t cores, uint64_t mem_bytes) {
+        std::ostringstream payload;
+        payload << "MIR|cpu=" << cpu_name << "|cores=" << cores << "|mem=" << mem_bytes;
+        write_record(10, 10, payload.str());
+    }
+
+    void write_pir(const DimmInfo& dimm) {
+        std::ostringstream payload;
+        payload << "PIR|slot=" << dimm.slot << "|vendor=" << dimm.vendor << "|sn=" << dimm.serial;
+        write_record(5, 10, payload.str());
+    }
+
+    void write_ptr(const std::string& name, double value) {
+        std::ostringstream payload;
+        payload << "PTR|" << name << "=" << std::fixed << std::setprecision(3) << value;
+        write_record(15, 10, payload.str());
+    }
+
+    void write_prr(const DimmInfo& dimm, bool pass, uint32_t fail_count) {
+        std::ostringstream payload;
+        payload << "PRR|slot=" << dimm.slot << "|result=" << (pass ? "PASS" : "FAIL")
+                << "|fails=" << fail_count;
+        write_record(20, 10, payload.str());
+    }
+
+private:
+    void write_record(uint8_t typ, uint8_t sub, const std::string& payload) {
+        const uint16_t len = static_cast<uint16_t>(payload.size());
+        out_.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out_.write(reinterpret_cast<const char*>(&typ), sizeof(typ));
+        out_.write(reinterpret_cast<const char*>(&sub), sizeof(sub));
+        out_.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    std::ofstream out_;
+};
+
+class MemoryTester {
+public:
+    explicit MemoryTester(TestConfig cfg)
+        : cfg_(cfg), memory_(cfg.total_bytes / sizeof(uint64_t), 0),
+          owner_(memory_.size(), -1),
+          dimms_{{"DIMM_A1", "SAMSUNG", "00000001"}, {"DIMM_B1", "SKHYNIX", "00000002"}} {}
+
+    int run() {
+        auto start = Clock::now();
+        disable_watchdog();
+
+        STDFWriter stdf(cfg_.stdf_path);
+        if (!stdf.ok()) {
+            std::cerr << "failed to open STDF output: " << cfg_.stdf_path << '\n';
+            return 1;
+        }
+
+        stdf.write_mir("GENERIC_X86_64", cfg_.logical_cores, cfg_.total_bytes);
+        for (const auto& d : dimms_) {
+            stdf.write_pir(d);
+        }
+
+        auto ranges = partition_memory(cfg_.logical_cores);
+        run_parallel(ranges, [this](uint32_t tid, const MemoryRange& r) { functional_pattern_test(tid, r); });
+        run_parallel(ranges, [this](uint32_t tid, const MemoryRange& r) { rowhammer_like_test(tid, r); });
+
+        auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        stdf.write_ptr("elapsed_ms", elapsed_ms);
+        stdf.write_ptr("throughput_gbps", throughput_gbps(elapsed_ms));
+
+        summarize(stdf);
+        return failures_.empty() ? 0 : 2;
+    }
+
+private:
+    std::vector<MemoryRange> partition_memory(uint32_t cores) const {
+        std::vector<MemoryRange> ranges;
+        const uint64_t chunk = cfg_.total_bytes / cores;
+        uint64_t cursor = 0;
+        for (uint32_t i = 0; i < cores; ++i) {
+            uint64_t bytes = (i == cores - 1) ? (cfg_.total_bytes - cursor) : chunk;
+            ranges.push_back(MemoryRange{cursor, bytes});
+            cursor += bytes;
+        }
+        return ranges;
+    }
+
+    void disable_watchdog() const {
+        // UEFI porting point: gBS->SetWatchdogTimer(0,0,0,nullptr)
+    }
+
+    void run_parallel(const std::vector<MemoryRange>& ranges,
+                      const std::function<void(uint32_t, const MemoryRange&)>& task) {
+        std::vector<std::thread> workers;
+        workers.reserve(ranges.size());
+        for (uint32_t i = 0; i < ranges.size(); ++i) {
+            workers.emplace_back([&, i]() { task(i, ranges[i]); });
+        }
+        for (auto& t : workers) {
+            t.join();
+        }
+    }
+
+    void functional_pattern_test(uint32_t tid, const MemoryRange& range) {
+        const auto begin = static_cast<size_t>(range.start / sizeof(uint64_t));
+        const auto count = static_cast<size_t>(range.bytes / sizeof(uint64_t));
+        const auto end = begin + count;
+
+        constexpr uint64_t kPatternA = 0xAAAAAAAAAAAAAAAAull;
+        constexpr uint64_t kPatternB = 0x5555555555555555ull;
+
+        for (size_t i = begin; i < end; ++i) {
+            owner_[i] = static_cast<int>(tid);
+            memory_[i] = ((i & 1) == 0) ? kPatternA : kPatternB;
+        }
+
+        for (size_t i = begin; i < end; ++i) {
+            const uint64_t expected = ((i & 1) == 0) ? kPatternA : kPatternB;
+            if (memory_[i] != expected) {
+                report_failure(i, expected, memory_[i]);
+            }
+        }
+    }
+
+    void rowhammer_like_test(uint32_t tid, const MemoryRange& range) {
+        (void)tid;
+        const auto begin = static_cast<size_t>(range.start / sizeof(uint64_t));
+        const auto count = static_cast<size_t>(range.bytes / sizeof(uint64_t));
+        const auto end = begin + count;
+
+        if (count < 4096) {
+            return;
+        }
+
+        constexpr size_t kRowWords = 1024;
+        size_t victim = begin + kRowWords;
+        while (victim + kRowWords < end) {
+            const size_t agg_a = victim - kRowWords;
+            const size_t agg_b = victim + kRowWords;
+            for (uint32_t r = 0; r < cfg_.rowhammer_rounds; ++r) {
+                memory_[agg_a] ^= (0x1ull << (r & 63));
+                memory_[agg_b] ^= (0x1ull << ((r + 7) & 63));
+            }
+
+            const uint64_t observed = memory_[victim];
+            if (owner_[victim] >= 0 && observed == 0) {
+                report_failure(victim, 0xAAAAAAAAAAAAAAAAull, observed);
+            }
+            victim += kRowWords * 4;
+        }
+    }
+
+    void report_failure(size_t word_index, uint64_t expected, uint64_t observed) {
+        std::lock_guard<std::mutex> g(mu_);
+        FailureRecord f{};
+        f.physical_addr = static_cast<uint64_t>(word_index * sizeof(uint64_t));
+        f.expected = expected;
+        f.observed = observed;
+        f.dram = decoder_.decode(f.physical_addr);
+        f.dimm_label = decoder_.map_to_dimm(f.dram, dimms_);
+        failures_.push_back(std::move(f));
+    }
+
+    double throughput_gbps(double elapsed_ms) const {
+        if (elapsed_ms <= 0.001) {
+            return 0.0;
+        }
+        const double bytes_processed = static_cast<double>(cfg_.total_bytes) * 3.0;
+        const double sec = elapsed_ms / 1000.0;
+        return (bytes_processed / sec) / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    void summarize(STDFWriter& stdf) {
+        std::array<uint32_t, 2> dimm_fail{};
+        for (const auto& f : failures_) {
+            if (f.dram.channel < dimm_fail.size()) {
+                dimm_fail[f.dram.channel]++;
+            }
+        }
+
+        for (size_t i = 0; i < dimms_.size(); ++i) {
+            const bool pass = (dimm_fail[i] == 0);
+            stdf.write_prr(dimms_[i], pass, dimm_fail[i]);
+        }
+
+        std::cout << "=== NextGen MemTest Summary ===\n";
+        std::cout << "total memory: " << cfg_.total_bytes / (1024 * 1024) << " MiB\n";
+        std::cout << "cores used:   " << cfg_.logical_cores << "\n";
+        std::cout << "failures:     " << failures_.size() << "\n";
+
+        const size_t preview = std::min<size_t>(8, failures_.size());
+        for (size_t i = 0; i < preview; ++i) {
+            const auto& f = failures_[i];
+            std::cout << "  [" << i << "] addr=0x" << std::hex << f.physical_addr << std::dec
+                      << " dimm=" << f.dimm_label
+                      << " CH" << f.dram.channel
+                      << " BG" << f.dram.bank_group
+                      << " B" << f.dram.bank
+                      << " R" << f.dram.row
+                      << " C" << f.dram.column
+                      << " exp=0x" << std::hex << f.expected
+                      << " got=0x" << f.observed << std::dec
+                      << "\n";
+        }
+        if (failures_.size() > preview) {
+            std::cout << "  ... and " << (failures_.size() - preview) << " more\n";
+        }
+        std::cout << "stdf: " << cfg_.stdf_path << "\n";
+    }
+
+    TestConfig cfg_;
+    std::vector<uint64_t> memory_;
+    std::vector<int> owner_;
+    AddressDecoder decoder_;
+    std::vector<DimmInfo> dimms_;
+
+    std::mutex mu_;
+    std::vector<FailureRecord> failures_;
+};
+
+}  // namespace nextgen_memtest
+
+int main(int argc, char** argv) {
+    using namespace nextgen_memtest;
+
+    TestConfig cfg;
+    if (argc >= 2) {
+        cfg.total_bytes = std::stoull(argv[1]);
+    }
+    if (argc >= 3) {
+        cfg.logical_cores = static_cast<uint32_t>(std::stoul(argv[2]));
+        if (cfg.logical_cores == 0) {
+            cfg.logical_cores = 1;
+        }
+    }
+    if (argc >= 4) {
+        cfg.stdf_path = argv[3];
+    }
+
+    MemoryTester tester(cfg);
+    return tester.run();
+}

@@ -1,0 +1,10 @@
+# Build outputs
+memtest_nextgen
+*.o
+*.obj
+
+# Test artifacts
+*.stdf
+
+# Editor/system
+.DS_Store
