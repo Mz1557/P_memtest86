@@ -1,0 +1,25 @@
+[Defines]
+  INF_VERSION                    = 0x0001001B
+  BASE_NAME                      = UefiMemtestApp
+  FILE_GUID                      = 7A56F2F1-8EE0-4D71-A81B-5D1AE7A6C94C
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 0.1
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  UefiMemtestApp.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  PrintLib
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+
+[Protocols]
+  gEfiMpServiceProtocolGuid

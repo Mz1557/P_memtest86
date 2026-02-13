@@ -54,6 +54,7 @@ struct TestConfig {
 
 class AddressDecoder {
 public:
+    // Prototype mapping: replace with IMC-register based decoding on UEFI target.
     DramAddress decode(uint64_t physical) const {
         DramAddress d{};
         d.channel = static_cast<uint32_t>((physical >> 6) & 0x1);
@@ -82,6 +83,7 @@ public:
 
     bool ok() const { return out_.is_open(); }
 
+    // STDF-style minimal records for downstream analytics (not full STDF compliance).
     void write_mir(const std::string& cpu_name, uint32_t cores, uint64_t mem_bytes) {
         std::ostringstream payload;
         payload << "MIR|cpu=" << cpu_name << "|cores=" << cores << "|mem=" << mem_bytes;
@@ -128,6 +130,7 @@ public:
 
     int run() {
         auto start = Clock::now();
+        // UEFI porting point: disable firmware watchdog before long stress runs.
         disable_watchdog();
 
         STDFWriter stdf(cfg_.stdf_path);
@@ -141,6 +144,7 @@ public:
             stdf.write_pir(d);
         }
 
+        // Current scheduler is equal-range sharding; can be replaced with topology-aware jobs.
         auto ranges = partition_memory(cfg_.logical_cores);
         run_parallel(ranges, [this](uint32_t tid, const MemoryRange& r) { functional_pattern_test(tid, r); });
         run_parallel(ranges, [this](uint32_t tid, const MemoryRange& r) { rowhammer_like_test(tid, r); });
@@ -170,6 +174,7 @@ private:
         // UEFI porting point: gBS->SetWatchdogTimer(0,0,0,nullptr)
     }
 
+    // Host-mode thread fanout; replace with EFI_MP_SERVICES_PROTOCOL in bare-metal.
     void run_parallel(const std::vector<MemoryRange>& ranges,
                       const std::function<void(uint32_t, const MemoryRange&)>& task) {
         std::vector<std::thread> workers;
@@ -190,6 +195,7 @@ private:
         constexpr uint64_t kPatternA = 0xAAAAAAAAAAAAAAAAull;
         constexpr uint64_t kPatternB = 0x5555555555555555ull;
 
+        // Verify immediately after write phase for baseline functional fault detection.
         for (size_t i = begin; i < end; ++i) {
             owner_[i] = static_cast<int>(tid);
             memory_[i] = ((i & 1) == 0) ? kPatternA : kPatternB;
@@ -213,6 +219,7 @@ private:
             return;
         }
 
+        // Simplified hammer model; real implementation needs precise bank/row adjacency.
         constexpr size_t kRowWords = 1024;
         size_t victim = begin + kRowWords;
         while (victim + kRowWords < end) {
@@ -252,6 +259,7 @@ private:
     }
 
     void summarize(STDFWriter& stdf) {
+        // Channel-level aggregation placeholder; can be expanded to DIMM/rank heatmaps.
         std::array<uint32_t, 2> dimm_fail{};
         for (const auto& f : failures_) {
             if (f.dram.channel < dimm_fail.size()) {
