@@ -34,5 +34,6 @@ UEFI MemTest Prototype Build Guide
 
 8) Current limitations of this prototype
 - Sweeps EfiConventionalMemory ranges only (not firmware-reserved/runtime regions).
-- Pattern is checkerboard fill/verify only.
+- Test suite now includes: checkerboard, moving inversions, random, block move, bit fade.
 - No IMC register parsing / SPD decode / real rowhammer adjacency engine yet.
+- Log output is written to memtest.log when SimpleFileSystem is available.

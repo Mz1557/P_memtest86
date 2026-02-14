@@ -7,13 +7,35 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
 #include <Pi/PiMultiPhase.h>
+#include <Protocol/LoadedImage.h>
 #include <Protocol/MpService.h>
+#include <Protocol/SimpleFileSystem.h>
+
+#define LOG_LINE_MAX 256
+
+typedef enum {
+  PHASE_FILL_CB = 0,
+  PHASE_VERIFY_CB,
+  PHASE_MOVEINV_FWD,
+  PHASE_MOVEINV_BWD,
+  PHASE_RANDOM_FILL,
+  PHASE_RANDOM_VERIFY,
+  PHASE_BLOCK_MOVE,
+  PHASE_BITFADE_FILL0,
+  PHASE_BITFADE_VERIFY0,
+  PHASE_BITFADE_FILL1,
+  PHASE_BITFADE_VERIFY1
+} TEST_PHASE;
 
 typedef struct {
   volatile UINT64 *Words;
-  UINTN Start;
-  UINTN End;
+  UINTN WordCount;
+  UINTN CpuIndex;
+  UINTN CpuCount;
+  UINT64 Seed;
   volatile UINT64 FailCount;
+  UINT64 *Scratch;
+  UINTN ScratchWords;
 } WORKER_CTX;
 
 typedef struct {
@@ -25,40 +47,104 @@ typedef struct {
 
 STATIC EFI_MP_SERVICES_PROTOCOL *gMp = NULL;
 STATIC WORKER_CTX *gWorkers = NULL;
+STATIC UINTN gBlockWords = 1024; // 8KB blocks
+STATIC TEST_PHASE gPhase = PHASE_FILL_CB;
+
+STATIC EFI_FILE_PROTOCOL *gLogFile = NULL;
+
+STATIC
+UINT64
+XorShift64Star(IN OUT UINT64 *State) {
+  UINT64 x = *State;
+  x ^= x >> 12;
+  x ^= x << 25;
+  x ^= x >> 27;
+  *State = x;
+  return x * 2685821657736338717ULL;
+}
 
 STATIC
 VOID
-EFIAPI
-FillPatternProc(IN VOID *Buffer) {
-  UINTN CpuIndex;
-  WORKER_CTX *Ctx;
+LogLine(IN CONST CHAR16 *Format, ...) {
+  VA_LIST Marker;
+  CHAR16 WideBuf[LOG_LINE_MAX];
+  CHAR8 AsciiBuf[LOG_LINE_MAX];
   UINTN i;
-  EFI_STATUS Status;
+  UINTN Size;
 
-  (VOID)Buffer;
-  if (gMp == NULL || gWorkers == NULL) {
-    return;
+  VA_START(Marker, Format);
+  UnicodeVSPrint(WideBuf, sizeof(WideBuf), Format, Marker);
+  VA_END(Marker);
+
+  Print(L"%s", WideBuf);
+
+  for (i = 0; i < LOG_LINE_MAX - 1; ++i) {
+    CHAR16 wc = WideBuf[i];
+    if (wc == L'\0') {
+      break;
+    }
+    AsciiBuf[i] = (wc < 0x80) ? (CHAR8)wc : '?';
   }
+  AsciiBuf[i] = '\0';
 
-  Status = gMp->WhoAmI(gMp, &CpuIndex);
+  if (gLogFile != NULL) {
+    Size = AsciiStrLen(AsciiBuf);
+    gLogFile->Write(gLogFile, &Size, AsciiBuf);
+  }
+}
+
+STATIC
+VOID
+InitLogFile(IN EFI_HANDLE ImageHandle) {
+  EFI_STATUS Status;
+  EFI_LOADED_IMAGE_PROTOCOL *Loaded;
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Sfs;
+  EFI_FILE_PROTOCOL *Root;
+
+  Status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Loaded);
   if (EFI_ERROR(Status)) {
     return;
   }
 
-  Ctx = &gWorkers[CpuIndex];
-  for (i = Ctx->Start; i < Ctx->End; ++i) {
-    Ctx->Words[i] = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
+  Status = gBS->HandleProtocol(Loaded->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Sfs);
+  if (EFI_ERROR(Status)) {
+    return;
+  }
+
+  Status = Sfs->OpenVolume(Sfs, &Root);
+  if (EFI_ERROR(Status)) {
+    return;
+  }
+
+  Status = Root->Open(
+      Root,
+      &gLogFile,
+      L"memtest.log",
+      EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+      0);
+  if (EFI_ERROR(Status)) {
+    gLogFile = NULL;
+  }
+}
+
+STATIC
+VOID
+CloseLogFile(VOID) {
+  if (gLogFile != NULL) {
+    gLogFile->Close(gLogFile);
+    gLogFile = NULL;
   }
 }
 
 STATIC
 VOID
 EFIAPI
-VerifyPatternProc(IN VOID *Buffer) {
+PhaseProc(IN VOID *Buffer) {
   UINTN CpuIndex;
   WORKER_CTX *Ctx;
-  UINTN i;
   EFI_STATUS Status;
+  UINTN block;
+  UINTN totalBlocks;
 
   (VOID)Buffer;
   if (gMp == NULL || gWorkers == NULL) {
@@ -71,10 +157,125 @@ VerifyPatternProc(IN VOID *Buffer) {
   }
 
   Ctx = &gWorkers[CpuIndex];
-  for (i = Ctx->Start; i < Ctx->End; ++i) {
-    UINT64 Expected = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
-    if (Ctx->Words[i] != Expected) {
-      Ctx->FailCount++;
+  if (Ctx->WordCount == 0 || Ctx->CpuCount == 0) {
+    return;
+  }
+
+  totalBlocks = (Ctx->WordCount + gBlockWords - 1U) / gBlockWords;
+
+  for (block = Ctx->CpuIndex; block < totalBlocks; block += Ctx->CpuCount) {
+    UINTN start = block * gBlockWords;
+    UINTN end = start + gBlockWords;
+    UINTN i;
+
+    if (end > Ctx->WordCount) {
+      end = Ctx->WordCount;
+    }
+
+    switch (gPhase) {
+      case PHASE_FILL_CB:
+        for (i = start; i < end; ++i) {
+          Ctx->Words[i] = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
+        }
+        break;
+      case PHASE_VERIFY_CB:
+        for (i = start; i < end; ++i) {
+          UINT64 Expected = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
+          if (Ctx->Words[i] != Expected) {
+            Ctx->FailCount++;
+          }
+        }
+        break;
+      case PHASE_MOVEINV_FWD:
+        for (i = start; i < end; ++i) {
+          UINT64 Expected = 0xAAAAAAAAAAAAAAAAULL;
+          if (Ctx->Words[i] != Expected) {
+            Ctx->FailCount++;
+          }
+          Ctx->Words[i] = ~Expected;
+        }
+        break;
+      case PHASE_MOVEINV_BWD:
+        for (i = end; i > start; --i) {
+          UINTN idx = i - 1U;
+          UINT64 Expected = 0x5555555555555555ULL;
+          if (Ctx->Words[idx] != Expected) {
+            Ctx->FailCount++;
+          }
+          Ctx->Words[idx] = ~Expected;
+        }
+        break;
+      case PHASE_RANDOM_FILL: {
+        UINT64 s = Ctx->Seed;
+        for (i = start; i < end; ++i) {
+          Ctx->Words[i] = XorShift64Star(&s);
+        }
+        Ctx->Seed = s;
+        break;
+      }
+      case PHASE_RANDOM_VERIFY: {
+        UINT64 s = Ctx->Seed;
+        for (i = start; i < end; ++i) {
+          UINT64 Expected = XorShift64Star(&s);
+          if (Ctx->Words[i] != Expected) {
+            Ctx->FailCount++;
+          }
+        }
+        Ctx->Seed = s;
+        break;
+      }
+      case PHASE_BLOCK_MOVE: {
+        if (Ctx->Scratch == NULL || Ctx->ScratchWords < (end - start)) {
+          break;
+        }
+        if (end == start) {
+          break;
+        }
+        // Swap with adjacent block if available.
+        if (block + 1U < totalBlocks) {
+          UINTN peerStart = (block + 1U) * gBlockWords;
+          UINTN peerEnd = peerStart + gBlockWords;
+          UINTN count = end - start;
+          if (peerEnd > Ctx->WordCount) {
+            peerEnd = Ctx->WordCount;
+          }
+          if (peerEnd - peerStart < count) {
+            count = peerEnd - peerStart;
+          }
+          if (count > 0) {
+            CopyMem(Ctx->Scratch, (VOID *)&Ctx->Words[start], count * sizeof(UINT64));
+            CopyMem((VOID *)&Ctx->Words[start], (VOID *)&Ctx->Words[peerStart], count * sizeof(UINT64));
+            CopyMem((VOID *)&Ctx->Words[peerStart], Ctx->Scratch, count * sizeof(UINT64));
+          }
+        }
+        break;
+      }
+      case PHASE_BITFADE_FILL0:
+        for (i = start; i < end; ++i) {
+          Ctx->Words[i] = 0x0000000000000000ULL;
+        }
+        break;
+      case PHASE_BITFADE_VERIFY0:
+        for (i = start; i < end; ++i) {
+          if (Ctx->Words[i] != 0x0000000000000000ULL) {
+            Ctx->FailCount++;
+          }
+        }
+        break;
+      case PHASE_BITFADE_FILL1:
+        for (i = start; i < end; ++i) {
+          Ctx->Words[i] = 0xFFFFFFFFFFFFFFFFULL;
+        }
+        break;
+      case PHASE_BITFADE_VERIFY1:
+        for (i = start; i < end; ++i) {
+          if (Ctx->Words[i] != 0xFFFFFFFFFFFFFFFFULL) {
+            Ctx->FailCount++;
+          }
+        }
+        break;
+      default:
+        break;
     }
   }
 }
@@ -138,12 +339,13 @@ BuildEnabledCpuList(
 
 STATIC
 EFI_STATUS
-RunPatternOnRange(
+RunPhaseOnRange(
     IN EFI_MP_SERVICES_PROTOCOL *Mp,
     IN OUT WORKER_CTX *Workers,
     IN UINTN WorkerCount,
     IN volatile UINT64 *Base,
     IN UINTN WordCount,
+    IN TEST_PHASE Phase,
     OUT UINT64 *RangeFailCount,
     OUT UINTN *UsedCpuCount) {
   EFI_STATUS Status;
@@ -151,7 +353,6 @@ RunPatternOnRange(
   UINTN EnabledCpuCount;
   UINTN TotalCpuCount;
   UINTN BspIndex;
-  UINTN Chunk;
   UINTN k;
 
   *RangeFailCount = 0;
@@ -173,57 +374,21 @@ RunPatternOnRange(
 
   for (k = 0; k < WorkerCount; ++k) {
     Workers[k].Words = Base;
-    Workers[k].Start = 0;
-    Workers[k].End = 0;
+    Workers[k].WordCount = WordCount;
+    Workers[k].CpuIndex = k;
+    Workers[k].CpuCount = EnabledCpuCount;
     Workers[k].FailCount = 0;
-  }
-
-  Chunk = (WordCount + EnabledCpuCount - 1U) / EnabledCpuCount;
-  for (k = 0; k < EnabledCpuCount; ++k) {
-    UINTN Cpu = EnabledCpuList[k];
-    UINTN Start = k * Chunk;
-    UINTN End = Start + Chunk;
-    if (Start > WordCount) {
-      Start = WordCount;
-    }
-    if (End > WordCount) {
-      End = WordCount;
-    }
-    Workers[Cpu].Words = Base;
-    Workers[Cpu].Start = Start;
-    Workers[Cpu].End = End;
-    Workers[Cpu].FailCount = 0;
+    Workers[k].Seed = (UINT64)(UINTN)Base ^ ((UINT64)k << 32) ^ 0x9E3779B97F4A7C15ULL;
   }
 
   gMp = Mp;
   gWorkers = Workers;
+  gPhase = Phase;
 
-  {
-    WORKER_CTX *W = &Workers[BspIndex];
-    UINTN i;
-    for (i = W->Start; i < W->End; ++i) {
-      W->Words[i] = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
-    }
-  }
+  // BSP participates directly.
+  PhaseProc(NULL);
 
-  Status = Mp->StartupAllAPs(Mp, FillPatternProc, FALSE, NULL, 0, NULL, NULL);
-  if (EFI_ERROR(Status) && Status != EFI_NOT_STARTED) {
-    FreePool(EnabledCpuList);
-    return Status;
-  }
-
-  {
-    WORKER_CTX *W = &Workers[BspIndex];
-    UINTN i;
-    for (i = W->Start; i < W->End; ++i) {
-      UINT64 Expected = ((i & 1U) == 0U) ? 0xAAAAAAAAAAAAAAAAULL : 0x5555555555555555ULL;
-      if (W->Words[i] != Expected) {
-        W->FailCount++;
-      }
-    }
-  }
-
-  Status = Mp->StartupAllAPs(Mp, VerifyPatternProc, FALSE, NULL, 0, NULL, NULL);
+  Status = Mp->StartupAllAPs(Mp, PhaseProc, FALSE, NULL, 0, NULL, NULL);
   if (EFI_ERROR(Status) && Status != EFI_NOT_STARTED) {
     FreePool(EnabledCpuList);
     return Status;
@@ -236,6 +401,62 @@ RunPatternOnRange(
   *UsedCpuCount = EnabledCpuCount;
 
   FreePool(EnabledCpuList);
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+RunFullSuiteOnRange(
+    IN EFI_MP_SERVICES_PROTOCOL *Mp,
+    IN OUT WORKER_CTX *Workers,
+    IN UINTN WorkerCount,
+    IN volatile UINT64 *Base,
+    IN UINTN WordCount,
+    OUT UINT64 *RangeFailCount,
+    OUT UINTN *UsedCpuCount) {
+  EFI_STATUS Status;
+  UINT64 Fails = 0;
+  UINT64 PhaseFails = 0;
+  UINTN CpuUsed = 0;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_FILL_CB, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_VERIFY_CB, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_MOVEINV_FWD, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_MOVEINV_BWD, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_RANDOM_FILL, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_RANDOM_VERIFY, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_BLOCK_MOVE, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_BITFADE_FILL0, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  gBS->Stall(2000000);
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_BITFADE_VERIFY0, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_BITFADE_FILL1, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  gBS->Stall(2000000);
+  Status = RunPhaseOnRange(Mp, Workers, WorkerCount, Base, WordCount, PHASE_BITFADE_VERIFY1, &PhaseFails, &CpuUsed);
+  if (EFI_ERROR(Status)) return Status;
+  Fails += PhaseFails;
+
+  *RangeFailCount = Fails;
+  *UsedCpuCount = CpuUsed;
   return EFI_SUCCESS;
 }
 
@@ -254,6 +475,8 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
   UINTN TotalCpuCount;
   UINTN EnabledCpuCount;
   WORKER_CTX *Workers;
+  UINT64 *ScratchPool;
+  UINTN ScratchWordsPerCpu = 4096; // 32KB
 
   ZeroMem(Summary, sizeof(*Summary));
 
@@ -288,6 +511,18 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
     return EFI_OUT_OF_RESOURCES;
   }
 
+  ScratchPool = (UINT64 *)AllocateZeroPool(sizeof(UINT64) * ScratchWordsPerCpu * TotalCpuCount);
+  if (ScratchPool == NULL) {
+    FreePool(Workers);
+    FreePool(MemMap);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  for (i = 0; i < TotalCpuCount; ++i) {
+    Workers[i].Scratch = ScratchPool + (i * ScratchWordsPerCpu);
+    Workers[i].ScratchWords = ScratchWordsPerCpu;
+  }
+
   Count = MemMapSize / DescSize;
   Desc = MemMap;
   for (i = 0; i < Count; ++i) {
@@ -311,9 +546,9 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
     Base = (volatile UINT64 *)(UINTN)Desc->PhysicalStart;
     Words = (UINTN)(Bytes / sizeof(UINT64));
 
-    Status = RunPatternOnRange(Mp, Workers, TotalCpuCount, Base, Words, &RangeFails, &UsedCpu);
+    Status = RunFullSuiteOnRange(Mp, Workers, TotalCpuCount, Base, Words, &RangeFails, &UsedCpu);
     if (EFI_ERROR(Status)) {
-      Print(L"Range test failed at 0x%lx (%r)\n", Desc->PhysicalStart, Status);
+      LogLine(L"Range test failed at 0x%lx (%r)\n", Desc->PhysicalStart, Status);
       Desc = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Desc + DescSize);
       continue;
     }
@@ -323,7 +558,7 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
     Summary->FailCount += RangeFails;
     Summary->CpuCount = UsedCpu;
 
-    Print(
+    LogLine(
         L"[R%u] start=0x%lx pages=%lu fails=%lu\n",
         (UINT32)Summary->RangeCount,
         Desc->PhysicalStart,
@@ -333,6 +568,7 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
     Desc = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Desc + DescSize);
   }
 
+  FreePool(ScratchPool);
   FreePool(Workers);
   FreePool(MemMap);
   return EFI_SUCCESS;
@@ -341,12 +577,12 @@ RunOfflineConventionalSweep(IN EFI_MP_SERVICES_PROTOCOL *Mp, OUT TEST_SUMMARY *S
 STATIC
 VOID
 PrintSummary(IN CONST TEST_SUMMARY *Summary, IN EFI_STATUS Status) {
-  Print(L"\n=== UEFI Offline MemTest Summary ===\n");
-  Print(L"Conventional ranges tested : %lu\n", (UINT64)Summary->RangeCount);
-  Print(L"Bytes tested               : %lu\n", Summary->TestedBytes);
-  Print(L"CPUs used                  : %lu\n", (UINT64)Summary->CpuCount);
-  Print(L"Total fail count           : %lu\n", Summary->FailCount);
-  Print(L"Status                     : %r\n", Status);
+  LogLine(L"\n=== UEFI Offline MemTest Summary ===\n");
+  LogLine(L"Conventional ranges tested : %lu\n", (UINT64)Summary->RangeCount);
+  LogLine(L"Bytes tested               : %lu\n", Summary->TestedBytes);
+  LogLine(L"CPUs used                  : %lu\n", (UINT64)Summary->CpuCount);
+  LogLine(L"Total fail count           : %lu\n", Summary->FailCount);
+  LogLine(L"Status                     : %r\n", Status);
 }
 
 EFI_STATUS
@@ -356,19 +592,21 @@ UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable) {
   EFI_MP_SERVICES_PROTOCOL *Mp;
   TEST_SUMMARY Summary;
 
-  (VOID)ImageHandle;
   (VOID)SystemTable;
 
   gBS->SetWatchdogTimer(0, 0, 0, NULL);
+  InitLogFile(ImageHandle);
 
   Status = gBS->LocateProtocol(&gEfiMpServiceProtocolGuid, NULL, (VOID **)&Mp);
   if (EFI_ERROR(Status)) {
-    Print(L"MP Services not available: %r\n", Status);
+    LogLine(L"MP Services not available: %r\n", Status);
+    CloseLogFile();
     return Status;
   }
 
-  Print(L"Starting offline sweep of EfiConventionalMemory ranges...\n");
+  LogLine(L"Starting offline sweep (checkerboard, moving inversions, random, block move, bit fade)...\n");
   Status = RunOfflineConventionalSweep(Mp, &Summary);
   PrintSummary(&Summary, Status);
+  CloseLogFile();
   return Status;
 }
